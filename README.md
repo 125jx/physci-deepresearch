@@ -80,6 +80,15 @@ python scripts/download.py
 
 # 2. Produce your model's predictions as predictions.jsonl
 #    one JSON object per line: {"id": "physci-001", "response": "..."}
+#
+#    Bring your own predictions with any system, OR use the bundled baseline
+#    generator (queries an OpenAI-compatible endpoint; attaches figures/PDFs
+#    from files/ for multimodal / long-context items):
+python -m eval.predict --data-dir PhySciBench --out predictions.jsonl \
+    --model gpt-5.2 --concurrency 16
+#    (model connection via --model/--base-url/--api-key or PREDICT_LLM_* /
+#     OPENAI_* env vars; add --no-attach-files for a text-only endpoint or a
+#     JSON-only download, and --resume to continue an interrupted run.)
 
 # 3. Configure the judge (copy .env.example -> .env and fill in)
 cp .env.example .env

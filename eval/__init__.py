@@ -4,4 +4,4 @@ Clean-room package: imports nothing from `core/agents`, `core/context`,
 `core/db`, `tools/*`, the OpenAI Agents SDK, `sqlmodel`, or selenium/pyvirtualdisplay.
 """
 
-__all__ = ["score", "judge", "metrics", "data", "config", "sandbox", "prompts"]
+__all__ = ["score", "predict", "judge", "metrics", "data", "config", "sandbox", "prompts"]
