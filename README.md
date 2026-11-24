@@ -97,6 +97,23 @@ cp .env.example .env
 python -m eval.score --predictions predictions.jsonl --data-dir PhySciBench --out metrics.json
 ```
 
+ ======== 修改部分
+For the original-side Codex agent (CLI `0.167.0`), run the following from the repository root.
+Replace `<MODEL_ID>` with the model's raw ID and configure `OPENAI_API_KEY` (optionally
+`OPENAI_BASE_URL` for a Responses-compatible endpoint) and `JUDGE_LLM_*` in your environment.
+The scorer does not load `.env` automatically.
+
+```bash
+# Generate answers with Codex
+python -m eval.predict --agent codex \
+    --model '<MODEL_ID>' --data-dir PhySciBench \
+    --out predictions_codex.jsonl --concurrency 1 --timeout 3600
+
+# Score with the original evaluator
+python -m eval.score --data-dir PhySciBench \
+    --predictions predictions_codex.jsonl --out metrics_codex.json
+```
+
 `metrics.json` reports the **overall Average Score** plus **per-`category`** and **per-`type`** accuracy / average score.
 
 **Judge configuration** (OpenAI-compatible endpoint), via env vars (see [`.env.example`](.env.example)):

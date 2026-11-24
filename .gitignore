@@ -17,6 +17,7 @@
 # Eval I/O
 /predictions*.jsonl
 /metrics*.json
+*.codex-logs/
 
 # Python
 __pycache__/

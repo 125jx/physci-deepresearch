@@ -26,6 +26,9 @@ Example:
 File attachment requires an endpoint that accepts PDF/image content parts; for a
 text-only endpoint (or JSON-only download without `files/`) pass
 `--no-attach-files` and only the question text is sent.
+
+Use `--agent codex` to generate the same predictions with the Codex CLI instead
+of a single LLM request. See README.md for original-side run commands.
 """
 
 import argparse
@@ -36,6 +39,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+from collections.abc import Awaitable, Callable
 
 from openai import APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 
@@ -198,6 +202,7 @@ async def run_predictions(
     max_retries: int = 4,
     timeout: float = 3600.0,
     resume: bool = False,
+    predictor: Callable[[Sample], Awaitable[str | None]] | None = None,
 ) -> dict:
     """Generate predictions for every benchmark sample and stream them to `out_path`.
 
@@ -218,7 +223,9 @@ async def run_predictions(
         len(samples), len(done_ids), len(todo), model, attach_files,
     )
 
-    client = AsyncOpenAI(api_key=api_key or "xxx", base_url=base_url, timeout=timeout)
+    client = None if predictor is not None else AsyncOpenAI(
+        api_key=api_key or "xxx", base_url=base_url, timeout=timeout
+    )
     semaphore = asyncio.Semaphore(concurrency)
     write_lock = asyncio.Lock()
     missing_warned: set[str] = set()
@@ -231,13 +238,16 @@ async def run_predictions(
     with open(out_path, mode, encoding="utf-8") as out_f:
 
         async def worker(sample: Sample) -> None:
-            content = build_message_content(
-                sample, files_dir, attach_files=attach_files, missing_warned=missing_warned
-            )
             async with semaphore:
-                response = await _predict_one(
-                    client, model, sample, content, temperature=temperature, max_retries=max_retries
-                )
+                if predictor is not None:
+                    response = await predictor(sample)
+                else:
+                    content = build_message_content(
+                        sample, files_dir, attach_files=attach_files, missing_warned=missing_warned
+                    )
+                    response = await _predict_one(
+                        client, model, sample, content, temperature=temperature, max_retries=max_retries
+                    )
             if response is None:
                 counters["failed"] += 1
                 return
@@ -252,7 +262,8 @@ async def run_predictions(
         try:
             await asyncio.gather(*(worker(s) for s in todo))
         finally:
-            await client.close()
+            if client is not None:
+                await client.close()
 
     summary = {
         "num_samples": len(samples),
@@ -271,19 +282,27 @@ async def run_predictions(
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PhySciBench baseline prediction generator")
+    parser.add_argument("--agent", choices=("llm", "codex"), default="llm", help="Prediction backend (default: llm)")
     parser.add_argument("--data-dir", default="PhySciBench", help="Data dir holding physcibench.json and files/ (default: PhySciBench)")
     parser.add_argument("--benchmark", default=None, help="Path to physcibench.json (default: <data-dir>/physcibench.json)")
     parser.add_argument("--out", default="predictions.jsonl", help="Output predictions path (default: predictions.jsonl)")
     parser.add_argument("--model", default=None, help="Model id (default: env PREDICT_LLM_MODEL / OPENAI_MODEL)")
     parser.add_argument("--base-url", default=None, help="OpenAI-compatible base URL (default: env PREDICT_LLM_BASE_URL / OPENAI_BASE_URL)")
     parser.add_argument("--api-key", default=None, help="API key (default: env PREDICT_LLM_API_KEY / OPENAI_API_KEY)")
-    parser.add_argument("--concurrency", type=int, default=8, help="Max concurrent requests (default: 8)")
+    parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent samples (default: llm=8, codex=1)")
     parser.add_argument("--limit", type=int, default=None, help="Predict only the first N samples")
     parser.add_argument("--no-attach-files", dest="attach_files", action="store_false", help="Send question text only (no figures/PDFs)")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (omitted from the request if unset)")
-    parser.add_argument("--max-retries", type=int, default=4, help="Retry attempts per sample on transient API errors (default: 4)")
+    parser.add_argument("--max-retries", type=int, default=None, help="Max attempts per sample (default: llm=4, codex=1)")
     parser.add_argument("--timeout", type=float, default=3600.0, help="Per-request timeout in seconds (default: 3600)")
     parser.add_argument("--resume", action="store_true", help="Skip ids already present in --out and append")
+    codex = parser.add_argument_group("Codex backend (--agent codex)")
+    codex.add_argument("--codex-bin", default="codex", help="Codex executable name or path")
+    codex.add_argument("--codex-logs-dir", default=None, help="Run logs/workspaces (default: <out-stem>.codex-logs/)")
+    codex.add_argument("--reasoning-effort", default=None, help="Codex model_reasoning_effort; match the Harbor-side setting")
+    codex.add_argument("--web-search", choices=("disabled", "cached", "live"), default="disabled", help="Codex web search mode (default: disabled)")
+    codex.add_argument("--codex-config", action="append", default=[], metavar="KEY=VALUE", help="Additional Codex TOML override; repeatable, applied last")
+    codex.add_argument("--codex-full-access", action="store_true", help="Use Harbor-style approval/sandbox bypass inside an externally isolated environment")
     parser.set_defaults(attach_files=True)
     return parser.parse_args(argv)
 
@@ -301,6 +320,39 @@ def main(argv: list[str] | None = None) -> None:
     base_url = args.base_url or _env("PREDICT_LLM_BASE_URL", "OPENAI_BASE_URL")
     api_key = args.api_key or _env("PREDICT_LLM_API_KEY", "OPENAI_API_KEY")
 
+    concurrency = args.concurrency if args.concurrency is not None else (1 if args.agent == "codex" else 8)
+    max_retries = args.max_retries if args.max_retries is not None else (1 if args.agent == "codex" else 4)
+    if concurrency < 1 or max_retries < 1 or args.timeout <= 0:
+        raise SystemExit("--concurrency, --max-retries, and --timeout must be positive.")
+    if args.limit is not None and args.limit < 0:
+        raise SystemExit("--limit must be nonnegative.")
+
+    predictor = None
+    if args.agent == "codex":
+        if args.temperature is not None:
+            raise SystemExit("--temperature is only supported by --agent llm; configure Codex with --codex-config if supported.")
+        from .agents.codex import CodexAgent
+
+        try:
+            codex_agent = CodexAgent(
+                model=model,
+                files_dir=data_dir / "files",
+                logs_dir=args.codex_logs_dir or str(pathlib.Path(args.out).with_suffix(".codex-logs")),
+                codex_bin=args.codex_bin,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=args.timeout,
+                max_attempts=max_retries,
+                attach_files=args.attach_files,
+                reasoning_effort=args.reasoning_effort,
+                web_search=args.web_search,
+                config_overrides=args.codex_config,
+                full_access=args.codex_full_access,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
+        predictor = codex_agent.predict
+
     summary = asyncio.run(
         run_predictions(
             benchmark_path=benchmark_path,
@@ -309,13 +361,14 @@ def main(argv: list[str] | None = None) -> None:
             model=model,
             base_url=base_url,
             api_key=api_key,
-            concurrency=args.concurrency,
+            concurrency=concurrency,
             limit=args.limit,
             attach_files=args.attach_files,
             temperature=args.temperature,
-            max_retries=args.max_retries,
+            max_retries=max_retries,
             timeout=args.timeout,
             resume=args.resume,
+            predictor=predictor,
         )
     )
     logger.info("Done. %s", json.dumps(summary, ensure_ascii=False))
